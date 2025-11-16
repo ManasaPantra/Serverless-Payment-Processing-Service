@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.python-version
+.venv/
+venv/
+.env
+.env.*
+
+# macOS
+.DS_Store
+
+# IDEs/Editors
+.vscode/
+.idea/
+
+# AWS SAM build artifacts
+.aws-sam/
+
+# Node (if used)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Coverage / test
+.coverage
+coverage.xml
+htmlcov/
+.pytest_cache/
+
+

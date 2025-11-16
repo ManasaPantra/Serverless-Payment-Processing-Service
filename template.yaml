@@ -1,0 +1,363 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless Payment Processing Service - Lambda · API Gateway · CloudFront · WAF
+
+Parameters:
+  StageName:
+    Type: String
+    Default: prod
+    Description: API stage name for REST and WebSocket APIs
+  AllowedWebhookCidrs:
+    Type: CommaDelimitedList
+    Default: 3.18.12.63/32,3.130.192.231/32,13.235.14.237/32,13.235.122.149/32
+    Description: Comma-separated CIDR blocks allowed to call the /webhook endpoint (e.g., payment provider IPs)
+  SigningSecret:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: Optional HMAC signing secret for webhook validation (sent as X-Signature header)
+  StripeEndpointSecret:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: Stripe endpoint secret (starts with whsec_) for Stripe-Signature verification
+  StripeToleranceSeconds:
+    Type: Number
+    Default: 300
+    Description: Time tolerance for Stripe signatures in seconds (default 300)
+  EnableWebhookIpAllowList:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: When true, WAF will only allow /webhook from AllowedWebhookCidrs
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 15
+    MemorySize: 256
+    Tracing: Active
+    Environment:
+      Variables:
+        POWERTOOLS_SERVICE_NAME: payment-service
+
+Conditions:
+  UseIpAllowList: !Equals [!Ref EnableWebhookIpAllowList, 'true']
+
+Resources:
+  RestApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: PaymentRestApi
+      StageName: !Ref StageName
+      EndpointConfiguration: REGIONAL
+      TracingEnabled: true
+      MethodSettings:
+        - LoggingLevel: INFO
+          DataTraceEnabled: false
+          MetricsEnabled: true
+          ResourcePath: '/*'
+          HttpMethod: '*'
+
+  BroadcastTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: PaymentEventsTopic
+
+  ConnectionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      TableName: PaymentWebSocketConnections
+      AttributeDefinitions:
+        - AttributeName: connectionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: connectionId
+          KeyType: HASH
+
+  WebhookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: PaymentWebhookHandler
+      CodeUri: src/
+      Handler: webhook_handler.handler
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt BroadcastTopic.TopicName
+      Environment:
+        Variables:
+          BROADCAST_TOPIC_ARN: !Ref BroadcastTopic
+          SIGNING_SECRET: !Ref SigningSecret
+          STRIPE_ENDPOINT_SECRET: !Ref StripeEndpointSecret
+          STRIPE_TOLERANCE_SECONDS: !Ref StripeToleranceSeconds
+      Events:
+        Webhook:
+          Type: Api
+          Properties:
+            RestApiId: !Ref RestApi
+            Path: /webhook
+            Method: post
+
+  BroadcasterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: PaymentBroadcaster
+      CodeUri: src/
+      Handler: broadcaster.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConnectionTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - execute-api:ManageConnections
+              Resource: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*/@connections/*
+      Environment:
+        Variables:
+          CONNECTION_TABLE_NAME: !Ref ConnectionTable
+          WEBSOCKET_API_ID: !Ref WebSocketApi
+          WEBSOCKET_STAGE: !Ref StageName
+      Events:
+        FromSns:
+          Type: SNS
+          Properties:
+            Topic: !Ref BroadcastTopic
+
+  ConnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: PaymentWsConnect
+      CodeUri: src/
+      Handler: connect.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConnectionTable
+      Environment:
+        Variables:
+          CONNECTION_TABLE_NAME: !Ref ConnectionTable
+
+  DisconnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: PaymentWsDisconnect
+      CodeUri: src/
+      Handler: disconnect.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ConnectionTable
+      Environment:
+        Variables:
+          CONNECTION_TABLE_NAME: !Ref ConnectionTable
+
+  WebSocketApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: PaymentWebSocketApi
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: $request.body.action
+
+  WebSocketStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      StageName: !Ref StageName
+      AutoDeploy: true
+      ApiId: !Ref WebSocketApi
+
+  ConnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ConnectFunction.Arn}/invocations
+
+  DisconnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DisconnectFunction.Arn}/invocations
+
+  ConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $connect
+      AuthorizationType: NONE
+      Target: !Sub integrations/${ConnectIntegration}
+
+  DisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $disconnect
+      AuthorizationType: NONE
+      Target: !Sub integrations/${DisconnectIntegration}
+
+  ConnectPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ConnectFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/${StageName}/$connect
+
+  DisconnectPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DisconnectFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/${StageName}/$disconnect
+
+  # CloudFront Distribution to front the REST API for global latency
+  ApiCloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        HttpVersion: http2
+        DefaultRootObject: ''
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: RestApiOrigin
+            DomainName: !Sub ${RestApi}.execute-api.${AWS::Region}.amazonaws.com
+            OriginPath: !Sub /${StageName}
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+        DefaultCacheBehavior:
+          TargetOriginId: RestApiOrigin
+          ViewerProtocolPolicy: https-only
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+            - PUT
+            - POST
+            - PATCH
+            - DELETE
+          CachedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          ForwardedValues:
+            QueryString: true
+            Headers:
+              - '*'
+            Cookies:
+              Forward: all
+          MinTTL: 0
+          DefaultTTL: 0
+          MaxTTL: 0
+        CustomErrorResponses:
+          - ErrorCode: 404
+            ResponseCode: 404
+            ResponsePagePath: ''
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+
+  # WAFv2 (Regional) protecting the REST API stage. Blocks /webhook unless source IP is in allow-list.
+  WebhookAllowedIps:
+    Type: AWS::WAFv2::IPSet
+    Properties:
+      Name: PaymentWebhookAllowedIps
+      Scope: REGIONAL
+      IPAddressVersion: IPV4
+      Addresses: !Ref AllowedWebhookCidrs
+
+  ApiWebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: PaymentApiWebAcl
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        CloudWatchMetricsEnabled: true
+        MetricName: PaymentApiWebAcl
+        SampledRequestsEnabled: true
+      Rules: !If
+        - UseIpAllowList
+        - - Name: AllowWebhookFromTrustedIps
+            Priority: 0
+            Action:
+              Allow: {}
+            Statement:
+              AndStatement:
+                Statements:
+                  - IPSetReferenceStatement:
+                      ARN: !GetAtt WebhookAllowedIps.Arn
+                  - ByteMatchStatement:
+                      FieldToMatch:
+                        UriPath: {}
+                      PositionalConstraint: EXACTLY
+                      SearchString: /webhook
+                      TextTransformations:
+                        - Priority: 0
+                          Type: NONE
+            VisibilityConfig:
+              CloudWatchMetricsEnabled: true
+              MetricName: AllowWebhookFromTrustedIps
+              SampledRequestsEnabled: true
+          - Name: BlockWebhookFromOthers
+            Priority: 1
+            Action:
+              Block: {}
+            Statement:
+              ByteMatchStatement:
+                FieldToMatch:
+                  UriPath: {}
+                PositionalConstraint: EXACTLY
+                SearchString: /webhook
+                TextTransformations:
+                  - Priority: 0
+                    Type: NONE
+            VisibilityConfig:
+              CloudWatchMetricsEnabled: true
+              MetricName: BlockWebhookFromOthers
+              SampledRequestsEnabled: true
+          - Name: AWS-AWSManagedRulesCommonRuleSet
+            Priority: 10
+            OverrideAction:
+              None: {}
+            Statement:
+              ManagedRuleGroupStatement:
+                VendorName: AWS
+                Name: AWSManagedRulesCommonRuleSet
+            VisibilityConfig:
+              CloudWatchMetricsEnabled: true
+              MetricName: CommonRuleSet
+              SampledRequestsEnabled: true
+        - - Name: AWS-AWSManagedRulesCommonRuleSet
+            Priority: 10
+            OverrideAction:
+              None: {}
+            Statement:
+              ManagedRuleGroupStatement:
+                VendorName: AWS
+                Name: AWSManagedRulesCommonRuleSet
+            VisibilityConfig:
+              CloudWatchMetricsEnabled: true
+              MetricName: CommonRuleSet
+              SampledRequestsEnabled: true
+
+  ApiWebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Sub arn:aws:apigateway:${AWS::Region}::/restapis/${RestApi}/stages/${StageName}
+      WebACLArn: !GetAtt ApiWebAcl.Arn
+
+Outputs:
+  CloudFrontDomainName:
+    Description: CloudFront domain for the REST API
+    Value: !GetAtt ApiCloudFrontDistribution.DomainName
+  RestApiInvokeUrl:
+    Description: Regional REST API invoke URL
+    Value: !Sub https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}
+  WebSocketApiUrl:
+    Description: WebSocket API URL for clients
+    Value: !Sub wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}
+
+
